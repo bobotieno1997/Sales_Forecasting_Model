@@ -1,2 +1,5 @@
 project:
     name: sales-forecasting-model
+webserver:
+    host: 0.0.0.0
+    port: 8080
