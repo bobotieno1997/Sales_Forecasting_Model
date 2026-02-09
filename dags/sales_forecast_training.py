@@ -116,6 +116,85 @@ def sales_forecast_training():
                 logger.info(f"Validation summary: {validation_sumamary}")
                 
             return validation_sumamary
+    @task()
+    def train_models_task(validation_summary):
+        file_paths = validation_summary['file_paths']
+        logger.info(f"Training models...")
+        sales_df = []
+        max_files = 50 
+        for i, sales_file in enumerate(file_paths['sales'][:max_files]):
+            df = pd.read_parquet(sales_file)
+            sales_df.append(df)
+            if (i+1)%10 ==0:
+                logger.info(f"Loaded {i+1} sales files")
+
+        sales_df = pd.concat(sales_df, ignore_index=True) 
+        print(f"Comnined sales data shape : {sales_df.shape}")
+
+        daily_sales = (
+            sales_df.groupby(['date','store_id','product_id','category'])
+            .agg({'quantity_sold':'sum',
+                  'revenue':'sum',
+                  'cost':'sum',
+                  'profit':'sum',
+                  'discount_percent':'mean',
+                  'unit_price':'mean'})
+            .reset_index()
+        )
+
+        daily_sales = daily_sales.rename(columns={'revenue':'sales'})
+        if file_paths.get('promotions'):
+            promo_df = pd.read_parquet(file_paths['promotions'][0])
+            promo_summary = (
+                promo_df.groupby(
+                    ['date','product_id'])['discounte_percent']
+                    .max()
+                    .reset_index()
+                )
+            promo_summary['has_promotion'] = 1  
+
+            daily_sales = daily_sales.merge(
+                promo_summary[['date','product_id','has_promotion']],
+                on=['date','product_id'],
+                how='left'
+            )   
+            daily_sales['has_promotion'] = daily_sales['has_promotion'].fillna(0).astype(int)  
+
+
+        if file_paths.get('customer_traffic'):
+            traffic_dfs =[]
+            for traffic_file in file_paths['customer_traffic'][:10]:
+                traffic_dfs.append(pd.read_parquet(traffic_file))
+            traffic_df = pd.concat(traffic_dfs,ignore_index=True)
+            traffic_summary = (
+                traffic_df.groupby(['date','store_id'])
+                .agg({'customer_traffic':'sum',
+                      'is_holiday':'max'})
+                .reset_index()
+            )
+            daily_sales = daily_sales.merge(
+                traffic_summary,
+                on = ['date','store_id'],
+                how = 'left'
+            )
+
+        logger.info(f'Final training data: {daily_sales.shape}')
+        logger.info(f'Colums: {daily_sales.colums.tolist()}')
+
+        trainer = ModelTrainer()
+
+        store_daily_sales = (
+            daily_sales.group(['store_id','store_id'])
+            .agg({'sales':'sum',
+                  'has_promotion':'mean',
+                  'quantity_sold':'sum',
+                  'profit':'sum',
+                  'customer_traffic':'first',
+                  'is_holiday':'first'})
+        )
+        store_daily_sales['date'] = pd.to_datetime(store_daily_sales['date'])
+
+        
 
     extract_results = extract_data_task()
     validation_summary = validate_data_tast(extract_results)
