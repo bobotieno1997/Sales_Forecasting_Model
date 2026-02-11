@@ -1,14 +1,18 @@
 from datetime import datetime, timedelta
 from airflow.decorators import dag, task
+from airflow.operators.bash import BashOperator
+import pandas as pd
+import os
+import sys
 import logging
 
-
-import pandas as pd
-import sys
-
-
+# Add include path
 sys.path.append("/usr/local/airflow/include")
-from utils.data_generate import RealisticSalesDataGenerator
+
+from ml_models.train_models import ModelTrainer
+from utils.mlflow_utils import MLflowManager
+from data_validation.validators import DataValidator
+
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +36,7 @@ default_args = {
 def sales_forecast_training():
     @task()
     def extract_data_task():
+        from utils.data_generate import RealisticSalesDataGenerator
 
         data_output_dir = 'tmp/sales_data'
         generator = RealisticSalesDataGenerator(
@@ -116,6 +121,7 @@ def sales_forecast_training():
                 logger.info(f"Validation summary: {validation_sumamary}")
                 
             return validation_sumamary
+        
     @task()
     def train_models_task(validation_summary):
         file_paths = validation_summary['file_paths']
@@ -193,6 +199,71 @@ def sales_forecast_training():
                   'is_holiday':'first'})
         )
         store_daily_sales['date'] = pd.to_datetime(store_daily_sales['date'])
+        train_df, val_df, test_df = trainer.prepare-data(
+            store_daily_sales,
+            targer_col ='sales',
+            date_col='date',
+            group_cols=['store_id'],
+            categorical_cols=['store_id'],
+        )
+
+        logger.info(
+            f'Train shape: {train_df.shape}, val shape: {val_df.shape}, Test shape: {test_df.shape}'
+        )
+
+        results = trainer.train_all_models(
+            train_df, val_df, test_df,
+            terget_col = target_col,
+            use_optuna = True
+        )
+
+
+        for model_name, model_results in results.items():
+            if "metrics" in model_results:
+                print(f"\n{model_name} metrics:")
+                for metric, value in model_results["metrics"].items():
+                    print(f"  {metric}: {value:.4f}")
+        print("\nVisualization charts have been generated and saved to MLflow/MinIO")
+        print("Charts include:")
+        print("  - Model metrics comparison")
+        print("  - Predictions vs actual values")
+        print("  - Residuals analysis")
+        print("  - Error distribution")
+        print("  - Feature importance comparison")
+
+        serializable_results = {}
+        for model_name, model_results in results.items():
+            serializable_results[model_name] = {
+                "metrics": model_results.get("metrics", {})
+            }
+        import mlflow
+
+        current_run_id = (
+            mlflow.active_run().info.run_id if mlflow.active_run() else None
+        )
+        return {
+            "training_results": serializable_results,
+            "mlflow_run_id": current_run_id,
+        }
+
+
+    @task()
+    def evaluate_models_task(training_result):
+        results = training_result["training_results"]
+        mlflow_manager = MLflowManager()
+        best_model_name = None
+        best_rmse = float("inf")
+        for model_name, model_results in results.items():
+            if "metrics" in model_results and "rmse" in model_results["metrics"]:
+                if model_results["metrics"]["rmse"] < best_rmse:
+                    best_rmse = model_results["metrics"]["rmse"]
+                    best_model_name = model_name
+
+        print(f"Best model: {best_model_name} with RMSE: {best_rmse:.4f}")
+        best_run = mlflow_manager.get_best_model(metric="rmse", ascending=True)
+        return {"best_model": best_model_name, 
+                "best_run_id": best_run["run_id"]}
+
 
         
 

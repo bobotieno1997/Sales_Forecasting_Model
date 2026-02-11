@@ -346,6 +346,9 @@ class ModelTrainer:
                 'lightgbm' : lgb_weight
             }
 
+            # use a single weighed ensemble based on validation performance
+            ensemble_pred = (xgb_weight * xgb_pred) + (lgb_weight* lgb_pred)
+
             # Create the ensemble model object
             ensemble_models = {
                 'xgboost': xgb_model,
@@ -370,14 +373,153 @@ class ModelTrainer:
             }
 
 
+            #Generate visualization
+            logger.info("Generating visualization for model comparison")
+
+            try:
+                self._generate_and_lgo_visualisation(results, test_df, target_col)
+            except Exception as viz_error:
+                logger.error("Error during visualization generating: {viz_error}")
+            self.save_artifacts()
+
+            current_run_id = mlflow.active_run().info.run_id
+
+            self.mlflow_manager.end_run()
 
 
+            # Sync artifacts to MinIoS3
+            from utils.mlflow_s3_utils import MLflowS3Manager
 
+            logger.info("Syncing artifacts to MInioS3.....")
+            try:
+                s3_manager = MLflowS3Manager(self.config['s3'])
+                s3_manager.sync_mflow_artifacts_to_s3(current_run_id)
+                logger.info('Artifacts synced to s3 successfully')
+
+
+                from utils.s3_verfication import verify_s3_artifacts, log_s3_verification_result
+                
+                logger.info('Verifying s3 artifacts...')
+                verification_results = verify_s3_artifacts(run_id=current_run_id,
+                                                           expected_artifacts=[
+                                                               'models/',
+                                                               'scaler.pkl',
+                                                               'encoders.pkl',
+                                                               'feature_cols.pkl',
+                                                               'visualizations/',
+                                                               'reports/'])
+                log_s3_verification_result(verification_results)
+               
+                if not verification_results['success']:
+                    logger.error('S3 artifact verfication failed. Please check the logs for details')
+
+            except Exception as e:
+                logger.error(f'Error during s3 artifact sync: {e}')
 
         except Exception as e:
             self.mlflow_manager.end_run(status="FAILED")
             raise e
-        
+
         return results
-        logger.info("Training all models")
+
+
+    def save_artifacts(self):
+        # Save scalers and encoders
+        joblib.dump(self.scalers, '/tmp/scalers.pkl')
+        joblib.dump(self.encoders, '/tmp/encoders.pkl')
+        joblib.dump(self.feature_cols, '/tmp/feature_cols.pkl')
+        
+        # Save individual models in the expected format
+        import os
+        os.makedirs('/tmp/models/xgboost', exist_ok=True)
+        os.makedirs('/tmp/models/lightgbm', exist_ok=True)
+        os.makedirs('/tmp/models/ensemble', exist_ok=True)
+        
+        if 'xgboost' in self.models:
+            joblib.dump(self.models['xgboost'], '/tmp/models/xgboost/xgboost_model.pkl')
+        
+        if 'lightgbm' in self.models:
+            joblib.dump(self.models['lightgbm'], '/tmp/models/lightgbm/lightgbm_model.pkl')
+            
+        if 'ensemble' in self.models:
+            joblib.dump(self.models['ensemble'], '/tmp/models/ensemble/ensemble_model.pkl')
+        
+        self.mlflow_manager.log_artifacts('/tmp/')
+        
+        logger.info("Artifacts saved successfully")
+
+
+    def _generate_and_log_visualizations(self, results: Dict[str, Any], 
+                                       test_df: pd.DataFrame, 
+                                       target_col: str = 'sales') -> None:
+        """Generate and log model comparison visualizations to MLflow"""
+        try:
+            from ml_models.model_visualization import ModelVisualizer
+            import tempfile
+            import os
+            
+            logger.info("Starting visualization generation...")
+            visualizer = ModelVisualizer()
+            
+            # Extract metrics
+            metrics_dict = {}
+            for model_name, model_results in results.items():
+                if 'metrics' in model_results:
+                    metrics_dict[model_name] = model_results['metrics']
+            
+            # Prepare predictions data
+            predictions_dict = {}
+            for model_name, model_results in results.items():
+                if 'predictions' in model_results and model_results['predictions'] is not None:
+                    pred_df = test_df[['date']].copy()
+                    pred_df['prediction'] = model_results['predictions']
+                    predictions_dict[model_name] = pred_df
+            
+            # Extract feature importance if available
+            feature_importance_dict = {}
+            for model_name, model_results in results.items():
+                if model_name in ['xgboost', 'lightgbm'] and 'model' in model_results:
+                    model = model_results['model']
+                    if hasattr(model, 'feature_importances_'):
+                        importance_df = pd.DataFrame({
+                            'feature': self.feature_cols,
+                            'importance': model.feature_importances_
+                        }).sort_values('importance', ascending=False)
+                        feature_importance_dict[model_name] = importance_df
+            
+            # Create temporary directory for visualizations
+            with tempfile.TemporaryDirectory() as temp_dir:
+                logger.info(f"Creating visualizations in temporary directory: {temp_dir}")
+                
+                # Generate all visualizations
+                saved_files = visualizer.create_comprehensive_report(
+                    metrics_dict=metrics_dict,
+                    predictions_dict=predictions_dict,
+                    actual_data=test_df,
+                    feature_importance_dict=feature_importance_dict if feature_importance_dict else None,
+                    save_dir=temp_dir
+                )
+                
+                logger.info(f"Generated {len(saved_files)} visualization files: {list(saved_files.keys())}")
+                
+                # Log each visualization to MLflow
+                for viz_name, file_path in saved_files.items():
+                    if os.path.exists(file_path):
+                        mlflow.log_artifact(file_path, "visualizations")
+                        logger.info(f"Logged visualization: {viz_name} from {file_path}")
+                    else:
+                        logger.warning(f"Visualization file not found: {file_path}")
+                
+                # Also create a combined HTML report
+                self._create_combined_html_report(saved_files, temp_dir)
+                
+                # Log the combined report
+                combined_report = os.path.join(temp_dir, 'model_comparison_report.html')
+                if os.path.exists(combined_report):
+                    mlflow.log_artifact(combined_report, "reports")
+                    logger.info("Logged combined HTML report")
+                    
+        except Exception as e:
+            logger.error(f"Failed to generate visualizations: {e}")
+            # Don't fail the entire training if visualization fails
 
